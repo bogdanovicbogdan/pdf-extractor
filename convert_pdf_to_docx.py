@@ -66,15 +66,44 @@ PUA_MATH_MAP = {
 
 SYSTEM_FONT_CANDIDATES = {
     'calibri': r'C:\Windows\Fonts\calibri.ttf',
+    'calibri-regular': r'C:\Windows\Fonts\calibri.ttf',
     'calibrib': r'C:\Windows\Fonts\calibrib.ttf',
+    'calibri-bold': r'C:\Windows\Fonts\calibrib.ttf',
+    'calibri,bold': r'C:\Windows\Fonts\calibrib.ttf',
     'calibrii': r'C:\Windows\Fonts\calibrii.ttf',
+    'calibri-italic': r'C:\Windows\Fonts\calibrii.ttf',
+    'calibri,italic': r'C:\Windows\Fonts\calibrii.ttf',
     'arial': r'C:\Windows\Fonts\arial.ttf',
+    'arialmt': r'C:\Windows\Fonts\arial.ttf',
     'arialbd': r'C:\Windows\Fonts\arialbd.ttf',
-    'times': r'C:\Windows\Fonts\times.ttf',
-    'consola': r'C:\Windows\Fonts\consola.ttf',
+    'arial-boldmt': r'C:\Windows\Fonts\arialbd.ttf',
+    'arial-bold': r'C:\Windows\Fonts\arialbd.ttf',
+    'arial,bold': r'C:\Windows\Fonts\arialbd.ttf',
+    'ariali': r'C:\Windows\Fonts\ariali.ttf',
+    'arial-italicmt': r'C:\Windows\Fonts\ariali.ttf',
+    'arial-italic': r'C:\Windows\Fonts\ariali.ttf',
+    'arial,italic': r'C:\Windows\Fonts\ariali.ttf',
+    'arialunicodems': r'C:\Windows\Fonts\arialuni.ttf',
+    'timesnewroman': r'C:\Windows\Fonts\times.ttf',
+    'timesnewromanpsmt': r'C:\Windows\Fonts\times.ttf',
+    'timesnewromanps-boldmt': r'C:\Windows\Fonts\timesbd.ttf',
+    'timesnewroman-bold': r'C:\Windows\Fonts\timesbd.ttf',
+    'timesnewroman,bold': r'C:\Windows\Fonts\timesbd.ttf',
+    'consolas': r'C:\Windows\Fonts\consola.ttf',
+    'consolas-bold': r'C:\Windows\Fonts\consolab.ttf',
     'tahoma': r'C:\Windows\Fonts\tahoma.ttf',
+    'tahoma-bold': r'C:\Windows\Fonts\tahomabd.ttf',
     'verdana': r'C:\Windows\Fonts\verdana.ttf',
+    'verdana-bold': r'C:\Windows\Fonts\verdanab.ttf',
     'cambria': r'C:\Windows\Fonts\cambria.ttc',
+}
+
+SERBIAN_LATIN_CPS = {
+    0x0106, 0x0107,  # Ć, ć
+    0x010C, 0x010D,  # Č, č
+    0x0110, 0x0111,  # Đ, đ
+    0x0160, 0x0161,  # Š, š
+    0x017D, 0x017E,  # Ž, ž
 }
 
 
@@ -208,17 +237,16 @@ def fix_pdf_tounicode(doc):
             base_m = re.search(r'/BaseFont\s+/([A-Za-z0-9+,\-_]+)', obj)
             if base_m:
                 clean_font_name = re.sub(r'^[A-Z]{6}\+', '', base_m.group(1)).lower()
-                for key, sys_path in SYSTEM_FONT_CANDIDATES.items():
-                    if key in clean_font_name and os.path.exists(sys_path):
-                        try:
-                            f_sys = fitz.Font(fontfile=sys_path)
-                            for cp in scan_codepoints:
-                                g = f_sys.has_glyph(cp)
-                                if g > 0 and g not in gid_to_uni:
-                                    gid_to_uni[g] = cp
-                        except Exception:
-                            pass
-                        break
+                sys_path = SYSTEM_FONT_CANDIDATES.get(clean_font_name)
+                if sys_path and os.path.exists(sys_path):
+                    try:
+                        f_sys = fitz.Font(fontfile=sys_path)
+                        for cp in scan_codepoints:
+                            g = f_sys.has_glyph(cp)
+                            if g > 0 and g not in gid_to_uni:
+                                gid_to_uni[g] = cp
+                    except Exception:
+                        pass
 
         if not gid_to_uni:
             continue
@@ -229,12 +257,33 @@ def fix_pdf_tounicode(doc):
         except Exception:
             continue
 
+        # Provera kompatibilnosti GID tabele sa postojećim ToUnicode mapiranjem:
+        # 1) Ako u ToUnicode već postoje srpska slova i font se ne slaže sa njima, GID tabela nije ista (npr. druga verzija fonta).
+        # 2) Najmanje 75% postojećih CID unosa mora da se poklapa sa GID tabelom.
+        if tu_map:
+            serbian_conflict = any(
+                (u in SERBIAN_LATIN_CPS and gid_to_uni.get(cid) != u)
+                for cid, u in tu_map.items()
+            )
+            if serbian_conflict:
+                continue
+            matches = sum(1 for cid, u in tu_map.items() if gid_to_uni.get(cid) == u)
+            if matches / len(tu_map) < 0.75:
+                continue
+
         needs_patch = False
         merged = dict(tu_map)
         for cid, true_uni in gid_to_uni.items():
-            if cid in merged and merged[cid] != true_uni:
-                needs_patch = True
-            merged[cid] = true_uni
+            if cid in merged:
+                old_uni = merged[cid]
+                if old_uni != true_uni:
+                    # Prepravljamo samo ako je u ToUnicode srpsko slovo pogrešno mapirano na ASCII znak (npr. ć -> d, Ć -> D)
+                    # ili na nevalidan/zamenski karakter. Nikada ne gazimo već ispravna ne-ASCII slova!
+                    if (0x0020 <= old_uni <= 0x007E and true_uni in SERBIAN_LATIN_CPS) or old_uni in (0, 0xFFFD):
+                        merged[cid] = true_uni
+                        needs_patch = True
+            else:
+                merged[cid] = true_uni
 
         if needs_patch:
             try:
