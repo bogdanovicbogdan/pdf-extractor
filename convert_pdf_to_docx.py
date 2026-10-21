@@ -23,7 +23,10 @@ DEFAULT_AUTO_FOOTER = True
 PUA_BULLET_CHARS = {
     '\uf07d', '\uf0e3', '\uf06c', '\uf0d8', '\uf0a7', '\uf0b7', '\uf0fc',
     '\uf076', '\uf09f', '\uf077', '\uf0a8', '\uf0fe', '\uf02a', '\uf06e',
-    '\uf075', '\uf0d9',  
+    '\uf075', '\uf0d9',
+    '\u25b0', '\u25b1', '\u25aa', '\u25ab', '\u25ba', '\u25bb', '\u25b8', '\u25b9',
+    '\u25a0', '\u25a1', '\u25cf', '\u25cb', '\u25c6', '\u25c7', '\u2022', '\u2023',
+    '\u2043', '\u2219',
 }
 
 PUA_MATH_MAP = {
@@ -285,6 +288,101 @@ def _normalize_for_match(text):
     return t_clean, t_ascii_clean
 
 
+def is_bullet_start(text):
+    t = text.strip()
+    if not t:
+        return False
+    if t[0] in PUA_BULLET_CHARS or (0xF000 <= ord(t[0]) <= 0xF0FF):
+        return True
+    if re.match(r'^(\d+[\.\)]|[a-zA-Z][\.\)]|[-–—•])\s+', t):
+        return True
+    if re.match(r'^\d+\.$', t):
+        return True
+    return False
+
+
+def get_page_text_lines(page):
+    """
+    Izvlači sve linije teksta sa stranice u vizuelnom (rotiranom) koordinatnom sistemu,
+    uklanja duplirane drop-shadow kopije teksta i spaja horizontalne segmente koji se nalaze
+    u istom vizuelnom redu (npr. bullet simbol + tekst ili reči razdvojene zbog poravnanja).
+    """
+    rot = page.rotation_matrix
+    d = page.get_text("dict")
+    raw_lines = []
+    for b_idx, b in enumerate(d.get("blocks", [])):
+        if b.get("type") != 0:
+            continue
+        for l in b.get("lines", []):
+            r = fitz.Rect(l["bbox"]) * rot
+            spans_text = []
+            for s in l.get("spans", []):
+                st = s.get("text", "")
+                if st:
+                    spans_text.append(st)
+            txt = "".join(spans_text).strip()
+            if not txt:
+                continue
+            raw_lines.append({
+                "rect": r,
+                "text": txt,
+                "block_idx": b_idx,
+            })
+
+    # 1. Deduplikacija identičnih preklapajućih linija (npr. senka teksta u dijagramima)
+    deduped = []
+    for item in raw_lines:
+        r1 = item["rect"]
+        t1 = item["text"]
+        is_dup = False
+        for prev in deduped:
+            if prev["text"] == t1:
+                r2 = prev["rect"]
+                inter = r1 & r2
+                if not inter.is_empty:
+                    ia = inter.width * inter.height
+                    min_a = max(1.0, min(r1.width * r1.height, r2.width * r2.height))
+                    if ia / min_a >= 0.45 or (abs(r1.x0 - r2.x0) <= 4 and abs(r1.y0 - r2.y0) <= 4):
+                        is_dup = True
+                        break
+        if not is_dup:
+            deduped.append(item)
+
+    # 2. Spajanje horizontalnih segmenata u istom vizuelnom redu
+    deduped.sort(key=lambda x: (round(x["rect"].y1 / 6.0), x["rect"].x0))
+    merged = []
+    for item in deduped:
+        if not merged:
+            merged.append(item)
+            continue
+        prev = merged[-1]
+        r1, r2 = prev["rect"], item["rect"]
+        y_ov = min(r1.y1, r2.y1) - max(r1.y0, r2.y0)
+        min_h = max(1.0, min(r1.height, r2.height))
+        x_gap = r2.x0 - r1.x1
+        same_row = (y_ov / min_h >= 0.55) and (
+            abs((r1.y0 + r1.y1) / 2 - (r2.y0 + r2.y1) / 2) <= 6.0
+            or abs(r1.y1 - r2.y1) <= 5.0
+        )
+        can_join = False
+        if same_row and x_gap >= -3.0:
+            if prev["block_idx"] == item["block_idx"]:
+                can_join = True
+            elif (
+                prev["text"] in PUA_BULLET_CHARS
+                or re.match(r'^(\d+[\.\)]|[a-zA-Z][\.\)])$', prev["text"])
+            ) and x_gap <= 55.0:
+                can_join = True
+        if can_join:
+            sep = " " if (not prev["text"].endswith(" ") and not item["text"].startswith(" ")) else ""
+            prev["text"] = prev["text"] + sep + item["text"]
+            prev["rect"] = r1 | r2
+        else:
+            merged.append(item)
+
+    return merged
+
+
 def detect_repeated_slide_texts(doc):
     total_pages = len(doc)
     if total_pages < 3:
@@ -294,18 +392,17 @@ def detect_repeated_slide_texts(doc):
     for pno, page in enumerate(doc):
         ph = page.rect.height
         seen_on_page = set()
-        for b in page.get_text("blocks"):
-            y0, y1 = b[1], b[3]
-            in_margin = (y0 <= 0.18 * ph) or (y1 >= 0.82 * ph)
+        for tl in get_page_text_lines(page):
+            r = tl["rect"]
+            in_margin = (r.y0 <= 0.18 * ph) or (r.y1 >= 0.82 * ph)
             if not in_margin:
                 continue
-            for raw_line in b[4].splitlines():
-                line = clean_line_characters(raw_line).strip()
-                if not line or line.isdigit():
-                    continue
-                norm, norm_ascii = _normalize_for_match(line)
-                if len(norm) >= 3:
-                    seen_on_page.add(norm_ascii)
+            line = clean_line_characters(tl["text"]).strip()
+            if not line or line.isdigit():
+                continue
+            norm, norm_ascii = _normalize_for_match(line)
+            if len(norm) >= 3:
+                seen_on_page.add(norm_ascii)
         for norm_ascii in seen_on_page:
             line_page_counts[norm_ascii] += 1
 
@@ -391,68 +488,10 @@ def detect_repeating_images(doc):
         for s in seen_sigs:
             sig_counts[s] += 1
 
-    threshold = 2 if len(doc) >= 3 else 2
+    threshold = 2
     rep_xrefs = {x for x, c in xref_counts.items() if c >= threshold}
     rep_sigs = {s for s, c in sig_counts.items() if c >= threshold}
     return rep_xrefs, rep_sigs
-
-
-def is_logo_or_decoration(rect, img_w, img_h, page_w, page_h, remove_logos=True):
-    if (img_w <= 35 and img_h <= 35) or (rect.width <= 25 and rect.height <= 25):
-        return True
-    if (rect.height <= 10 and rect.width > 150) or (img_h <= 12 and img_w > 180):
-        return True
-    if (rect.width <= 10 and rect.height > 150) or (img_w <= 12 and img_h > 180):
-        return True
-    if rect.y0 >= 0.88 * page_h:
-        return True
-
-    if not remove_logos:
-        return False
-
-    if rect.width >= 0.85 * page_w and rect.height >= 0.85 * page_h:
-        return True
-
-    in_top_band = (rect.y1 <= 0.27 * page_h) and (rect.y0 <= 0.15 * page_h)
-    in_left_corner = (rect.x1 <= 0.25 * page_w)
-    in_right_corner = (rect.x0 >= 0.75 * page_w)
-    is_small_emblem = (rect.width <= 0.22 * page_w) and (rect.height <= 0.25 * page_h)
-
-    if in_top_band and (in_left_corner or in_right_corner) and is_small_emblem:
-        return True
-
-    in_bottom_band = (rect.y0 >= 0.78 * page_h)
-    if in_bottom_band and (in_left_corner or in_right_corner) and is_small_emblem:
-        return True
-
-    return False
-
-
-def deduplicate_images(img_entries):
-    if len(img_entries) <= 1:
-        return img_entries
-    kept = []
-    for item in img_entries:
-        r1 = item['rect']
-        overlap_found = False
-        for k_idx, k_item in enumerate(kept):
-            r2 = k_item['rect']
-            ix0 = max(r1.x0, r2.x0)
-            iy0 = max(r1.y0, r2.y0)
-            ix1 = min(r1.x1, r2.x1)
-            iy1 = min(r1.y1, r2.y1)
-            if ix1 > ix0 and iy1 > iy0:
-                inter_area = (ix1 - ix0) * (iy1 - iy0)
-                a1 = max(1e-5, r1.width * r1.height)
-                a2 = max(1e-5, r2.width * r2.height)
-                if inter_area / min(a1, a2) > 0.6:
-                    overlap_found = True
-                    if item['w'] * item['h'] > k_item['w'] * k_item['h']:
-                        kept[k_idx] = item
-                    break
-        if not overlap_found:
-            kept.append(item)
-    return kept
 
 
 def detect_template_drawings(doc):
@@ -460,61 +499,330 @@ def detect_template_drawings(doc):
         return set()
     rect_counts = Counter()
     for page in doc:
+        rot = page.rotation_matrix
+        pw, ph = page.rect.width, page.rect.height
         seen = set()
         for d in page.get_drawings():
-            r = d['rect']
-            seen.add((round(r.x0, 1), round(r.y0, 1), round(r.x1, 1), round(r.y1, 1)))
+            r = d['rect'] * rot
+            if r.width < 1.0:
+                r.x1 = r.x0 + 1.0
+            if r.height < 1.0:
+                r.y1 = r.y0 + 1.0
+            r = fitz.Rect(max(0, r.x0), max(0, r.y0), min(pw, r.x1), min(ph, r.y1))
+            seen.add((round(r.x0 / 2.0), round(r.y0 / 2.0), round(r.x1 / 2.0), round(r.y1 / 2.0)))
         for k in seen:
             rect_counts[k] += 1
     return {k for k, c in rect_counts.items() if c >= 3}
 
 
-def get_vector_diagram_clip(page, template_drawing_rects):
+def extract_slide_visual_regions(page, pno, doc, rep_xrefs, rep_sigs, tmpl_draws, text_lines, remove_logos=True):
+    """
+    Detektuje sve vizuelne regione (rasterske slike, složene slike iz segmenata i vektorske dijagrame)
+    u vizuelnom (rotiranom) koordinatnom sistemu stranice.
+    """
+    rot = page.rotation_matrix
     pw, ph = page.rect.width, page.rect.height
-    non_tmpl = []
-    for d in page.get_drawings():
-        r = d['rect']
-        if r.width >= 0.9 * pw and r.height >= 0.9 * ph:
+
+    # 1. Validni rasterski regioni
+    raster_entries = []
+    for im in page.get_images():
+        xref, smask = im[0], im[1]
+        if remove_logos and xref in rep_xrefs:
             continue
-        if r.y0 >= 0.88 * ph or r.y1 <= 0.10 * ph:
+        try:
+            base = doc.extract_image(xref)
+        except Exception:
             continue
-        key = (round(r.x0, 1), round(r.y0, 1), round(r.x1, 1), round(r.y1, 1))
-        if key not in template_drawing_rects:
-            non_tmpl.append(r)
-
-    if len(non_tmpl) < 6:
-        return None
-
-    u = fitz.Rect(non_tmpl[0])
-    for r in non_tmpl[1:]:
-        u |= r
-
-    if u.width < 80 or u.height < 40:
-        return None
-
-    expanded = fitz.Rect(u.x0 - 15, u.y0 - 15, u.x1 + 15, u.y1 + 15)
-    for b in page.get_text("blocks"):
-        br = fitz.Rect(b[0], b[1], b[2], b[3])
-        if br.y0 < 0.12 * ph or br.y1 > 0.88 * ph:
+        w, h = base["width"], base["height"]
+        sig = (w, h, len(base["image"]))
+        if remove_logos and sig in rep_sigs:
             continue
-        if br.intersects(expanded) and len(b[4].strip()) < 120:
-            expanded |= br
 
-    clip = fitz.Rect(
-        max(10, expanded.x0 - 8),
-        max(0.10 * ph, expanded.y0 - 8),
-        min(pw - 10, expanded.x1 + 8),
-        min(0.88 * ph, expanded.y1 + 8)
-    )
-    return clip
+        # Filtriranje PowerPoint drop-shadow / glow bitmapa iza teksta (smask > 0 + mali broj boja + preklapanje sa tekstom)
+        if smask > 0:
+            try:
+                pil_rgb = Image.open(io.BytesIO(base["image"])).convert("RGB")
+                small = pil_rgb.resize((min(64, max(1, w)), min(64, max(1, h))), Image.Resampling.NEAREST)
+                raw_b = small.tobytes()
+                colors = set(raw_b[i:i + 3] for i in range(0, len(raw_b), 3))
+                uniq_c = len(colors)
+            except Exception:
+                uniq_c = 999
+            if uniq_c <= 35:
+                is_shadow = False
+                for r_raw in page.get_image_rects(xref):
+                    r = r_raw * rot
+                    for tl in text_lines:
+                        inter = r & tl["rect"]
+                        if not inter.is_empty:
+                            ia = inter.width * inter.height
+                            if ia / max(1.0, min(r.width * r.height, tl["rect"].width * tl["rect"].height)) >= 0.25:
+                                is_shadow = True
+                                break
+                    if is_shadow:
+                        break
+                if is_shadow:
+                    continue
+
+        for r_raw in page.get_image_rects(xref):
+            r = (r_raw * rot) & page.rect
+            if r.is_empty:
+                continue
+            if (w <= 35 and h <= 35) or (r.width <= 25 and r.height <= 25):
+                continue
+            if (r.height <= 12 and r.width > 120) or (h <= 14 and w > 180):
+                continue
+            if (r.width <= 12 and r.height > 120) or (w <= 14 and h > 180):
+                continue
+            if r.y0 >= 0.88 * ph:
+                continue
+            if remove_logos:
+                if r.width >= 0.85 * pw and r.height >= 0.85 * ph:
+                    continue
+                in_top_band = (r.y1 <= 0.28 * ph) and (r.y0 <= 0.16 * ph)
+                in_left = (r.x1 <= 0.26 * pw)
+                in_right = (r.x0 >= 0.74 * pw)
+                is_emblem = (r.width <= 0.24 * pw) and (r.height <= 0.26 * ph)
+                if in_top_band and (in_left or in_right) and is_emblem:
+                    continue
+                in_bot_band = (r.y0 >= 0.75 * ph) or (pno == 0 and r.y0 >= 0.55 * ph)
+                if in_bot_band and (in_left or in_right) and is_emblem:
+                    continue
+                if pno == 0:
+                    continue
+
+            raster_entries.append({
+                "rect": r,
+                "w": w,
+                "h": h,
+                "xref": xref,
+                "smask": smask,
+            })
+
+    # Deduplikacija preklapajućih rasterskih pravougaonika
+    kept_rasters = []
+    for item in raster_entries:
+        r1 = item["rect"]
+        overlapped = False
+        for k_idx, k_item in enumerate(kept_rasters):
+            r2 = k_item["rect"]
+            inter = r1 & r2
+            if not inter.is_empty:
+                ia = inter.width * inter.height
+                if ia / max(1.0, min(r1.width * r1.height, r2.width * r2.height)) > 0.55:
+                    overlapped = True
+                    if (r1.width * r1.height) > (r2.width * r2.height):
+                        kept_rasters[k_idx] = item
+                    break
+        if not overlapped:
+            kept_rasters.append(item)
+
+    # 2. Detekcija klastera vektorskih dijagrama (preskače se naslovni slajd pno == 0)
+    vector_clusters = []
+    if pno > 0:
+        cand_drawings = []
+        for d in page.get_drawings():
+            r = d["rect"] * rot
+            if r.width < 1.0:
+                r.x1 = r.x0 + 1.0
+            if r.height < 1.0:
+                r.y1 = r.y0 + 1.0
+            if r.width >= 0.85 * pw and r.height >= 0.85 * ph:
+                continue
+            if d.get("fill") == (1.0, 1.0, 1.0) and d.get("color") is None:
+                continue
+            if (r.x0 < -5 or r.x1 > pw + 5) and r.width >= 0.85 * pw:
+                continue
+            r = fitz.Rect(max(0, r.x0), max(0, r.y0), min(pw, r.x1), min(ph, r.y1))
+            if r.width <= 0 or r.height <= 0:
+                continue
+            if r.y1 <= 0.12 * ph or r.y0 >= 0.94 * ph:
+                continue
+            key = (round(r.x0 / 2.0), round(r.y0 / 2.0), round(r.x1 / 2.0), round(r.y1 / 2.0))
+            if key in tmpl_draws:
+                continue
+            if r.width <= 14 and r.height <= 14:
+                continue
+            cand_drawings.append(r)
+
+        # Izbacivanje izolovanih tankih horizontalnih linija (npr. podvlačenje reči u tekstu)
+        filtered_drawings = []
+        for i, r in enumerate(cand_drawings):
+            if r.height <= 4.5 and r.width >= 20:
+                has_neighbor = False
+                exp = fitz.Rect(r.x0 - 18, r.y0 - 18, r.x1 + 18, r.y1 + 18)
+                for j, r2 in enumerate(cand_drawings):
+                    if i != j and exp.intersects(r2):
+                        has_neighbor = True
+                        break
+                if not has_neighbor:
+                    continue
+            filtered_drawings.append(r)
+
+        # Prepoznavanje običnih tekstualnih pasusa na slajdu (dugi redovi, bullet stavke i njihovi prelomljeni nastavci)
+        prose_indices = set()
+        for idx_tl, tl in enumerate(text_lines):
+            if len(tl["text"]) > 26 or tl["rect"].width > 155 or is_bullet_start(tl["text"]):
+                prose_indices.add(idx_tl)
+        changed_p = True
+        while changed_p:
+            changed_p = False
+            for idx_tl, tl in enumerate(text_lines):
+                if idx_tl in prose_indices:
+                    continue
+                r_curr = tl["rect"]
+                for idx_p in list(prose_indices):
+                    r_prev = text_lines[idx_p]["rect"]
+                    if tl["block_idx"] == text_lines[idx_p]["block_idx"] or (
+                        abs(r_curr.x0 - r_prev.x0) <= 6.0 and -5.0 <= (r_curr.y0 - r_prev.y1) <= 10.0
+                    ):
+                        prose_indices.add(idx_tl)
+                        changed_p = True
+                        break
+
+        bridge_labels = [
+            tl["rect"] for idx_tl, tl in enumerate(text_lines)
+            if idx_tl not in prose_indices
+            and tl["rect"].y0 > 0.14 * ph
+            and tl["rect"].y1 < 0.93 * ph
+        ]
+
+        n_d = len(filtered_drawings)
+        visited = [False] * n_d
+        for i in range(n_d):
+            if visited[i]:
+                continue
+            visited[i] = True
+            comp_indices = [i]
+            comp_rect = fitz.Rect(filtered_drawings[i])
+            changed = True
+            while changed:
+                changed = False
+                exp_comp = fitz.Rect(comp_rect.x0 - 22, comp_rect.y0 - 22, comp_rect.x1 + 22, comp_rect.y1 + 22)
+                for idx_c in comp_indices:
+                    dr_c = filtered_drawings[idx_c]
+                    near_d = fitz.Rect(dr_c.x0 - 12, dr_c.y0 - 12, dr_c.x1 + 12, dr_c.y1 + 12)
+                    for bl in bridge_labels:
+                        if near_d.intersects(bl):
+                            exp_comp |= fitz.Rect(bl.x0 - 14, bl.y0 - 14, bl.x1 + 14, bl.y1 + 14)
+                for j in range(n_d):
+                    if not visited[j] and exp_comp.intersects(filtered_drawings[j]):
+                        visited[j] = True
+                        comp_indices.append(j)
+                        comp_rect |= filtered_drawings[j]
+                        changed = True
+
+            touches_raster = any(
+                fitz.Rect(comp_rect.x0 - 15, comp_rect.y0 - 15, comp_rect.x1 + 15, comp_rect.y1 + 15).intersects(re_item["rect"])
+                for re_item in kept_rasters
+            )
+            min_drawings = 3 if touches_raster else 4
+            if len(comp_indices) >= min_drawings and comp_rect.width >= 55 and comp_rect.height >= 24:
+                expanded = fitz.Rect(comp_rect)
+                comp_draw_rects = [filtered_drawings[idx_c] for idx_c in comp_indices]
+                for _ in range(2):
+                    for idx_tl, tl in enumerate(text_lines):
+                        tr = tl["rect"]
+                        if tr.y0 <= 0.13 * ph or tr.y1 >= 0.95 * ph:
+                            continue
+                        if is_bullet_start(tl["text"]):
+                            continue
+                        if re.match(r'^\d+(\s*/\s*\d+)?$', tl["text"].strip()) and (tr.y1 >= 0.85 * ph or tr.x0 >= 0.88 * pw):
+                            continue
+                        inter = tr & comp_rect
+                        inside_ratio = (inter.width * inter.height) / max(1.0, tr.width * tr.height) if not inter.is_empty else 0.0
+                        near_any_drawing = any(
+                            fitz.Rect(dr_c.x0 - 14, dr_c.y0 - 16, dr_c.x1 + 14, dr_c.y1 + 16).intersects(tr)
+                            for dr_c in comp_draw_rects
+                        )
+                        if inside_ratio >= 0.45 or (near_any_drawing and idx_tl not in prose_indices and len(tl["text"]) <= 25 and tr.width <= 145):
+                            expanded |= tr
+                            comp_draw_rects.append(tr)
+                vector_clusters.append(expanded)
+
+    # 3. Spajanje rasterskih regiona i vektorskih klastera u jedinstvene vizuelne regione
+    regions = [{"rect": fitz.Rect(r["rect"]), "type": "raster", "rasters": [r]} for r in kept_rasters]
+    for vc in vector_clusters:
+        regions.append({"rect": fitz.Rect(vc), "type": "vector", "rasters": []})
+
+    bullet_rects = [tl["rect"] for tl in text_lines if is_bullet_start(tl["text"])]
+
+    merged_any = True
+    while merged_any and len(regions) > 1:
+        merged_any = False
+        for i in range(len(regions)):
+            for j in range(i + 1, len(regions)):
+                r1, r2 = regions[i]["rect"], regions[j]["rect"]
+                t1, t2 = regions[i]["type"], regions[j]["type"]
+                inter = r1 & r2
+                actually_overlaps = not inter.is_empty and (inter.width * inter.height) > 4.0
+                is_aligned_strip = (
+                    (abs(r1.x0 - r2.x0) <= 6 and abs(r1.x1 - r2.x1) <= 6 and min(abs(r1.y1 - r2.y0), abs(r2.y1 - r1.y0)) <= 6) or
+                    (abs(r1.y0 - r2.y0) <= 6 and abs(r1.y1 - r2.y1) <= 6 and min(abs(r1.x1 - r2.x0), abs(r2.x1 - r1.x0)) <= 6)
+                )
+                exp1 = fitz.Rect(r1.x0 - 8, r1.y0 - 8, r1.x1 + 8, r1.y1 + 8)
+                vec_raster_touch = (t1 != "raster" or t2 != "raster") and exp1.intersects(r2)
+
+                if actually_overlaps or is_aligned_strip or vec_raster_touch:
+                    union_r = r1 | r2
+                    swallows_bullet = any(
+                        union_r.intersects(br) and not r1.intersects(br) and not r2.intersects(br)
+                        for br in bullet_rects
+                    )
+                    if not swallows_bullet:
+                        regions[i]["rect"] = union_r
+                        regions[i]["type"] = "composite"
+                        regions[i]["rasters"].extend(regions[j]["rasters"])
+                        regions.pop(j)
+                        merged_any = True
+                        break
+            if merged_any:
+                break
+
+    # Proširenje rasterskih/složenih regiona ako ih presecaju pojedinačni vektorski okviri ili markeri (npr. highlight pravougaonici)
+    if pno > 0:
+        for reg in regions:
+            rr = reg["rect"]
+            exp_r = fitz.Rect(rr.x0 - 6, rr.y0 - 6, rr.x1 + 6, rr.y1 + 6)
+            for d in page.get_drawings():
+                dr = d["rect"] * rot
+                if dr.width < 1.0:
+                    dr.x1 = dr.x0 + 1.0
+                if dr.height < 1.0:
+                    dr.y1 = dr.y0 + 1.0
+                if (dr.width >= 0.85 * pw and dr.height >= 0.85 * ph) or (d.get("fill") == (1.0, 1.0, 1.0) and d.get("color") is None):
+                    continue
+                dr = fitz.Rect(max(0, dr.x0), max(0, dr.y0), min(pw, dr.x1), min(ph, dr.y1))
+                if dr.width <= 0 or dr.height <= 0:
+                    continue
+                if dr.y1 <= 0.12 * ph or dr.y0 >= 0.94 * ph:
+                    continue
+                key = (round(dr.x0 / 2.0), round(dr.y0 / 2.0), round(dr.x1 / 2.0), round(dr.y1 / 2.0))
+                if key in tmpl_draws:
+                    continue
+                if dr.width <= 14 and dr.height <= 14:
+                    continue
+                if exp_r.intersects(dr) and dr.width <= 0.85 * pw and dr.height <= 0.85 * ph:
+                    union_r = reg["rect"] | dr
+                    if not any(union_r.intersects(br) and not reg["rect"].intersects(br) for br in bullet_rects):
+                        reg["rect"] = union_r
+                        reg["type"] = "composite"
+
+    regions.sort(key=lambda reg: (round(reg["rect"].y0 / 20.0), reg["rect"].x0))
+    return regions
 
 
 def insert_image(doc, img_bytes, w, h):
     try:
-        img_stream = io.BytesIO(img_bytes)
-        pil_img = Image.open(img_stream)
+        pil_img = Image.open(io.BytesIO(img_bytes))
         pw, ph = pil_img.size
-        img_stream.seek(0)
+
+        # Konverzija u standardni PNG u memoriji kako python-docx nikada ne bi bacio UnrecognizedImageError
+        if pil_img.mode not in ("RGB", "RGBA", "L"):
+            pil_img = pil_img.convert("RGBA" if "A" in pil_img.mode else "RGB")
+        png_stream = io.BytesIO()
+        pil_img.save(png_stream, format="PNG")
+        png_stream.seek(0)
 
         max_w = 5.6
         max_h = 4.5
@@ -540,7 +848,7 @@ def insert_image(doc, img_bytes, w, h):
         p.paragraph_format.keep_with_next = True
 
         run = p.add_run()
-        run.add_picture(img_stream, width=Inches(disp_w))
+        run.add_picture(png_stream, width=Inches(disp_w))
     except Exception as e:
         print(f"      [Upozorenje] Greška pri umetanju slike: {e}")
 
@@ -610,97 +918,82 @@ def convert_pdf_to_docx(
         h_run.font.bold = True
         h_run.font.color.rgb = RGBColor(31, 78, 121)
 
-        blocks = page.get_text("blocks")
-        blocks_sorted = sorted(blocks, key=lambda b: (1 if b[0] >= 0.55 * pw else 0, round(b[1], 1), round(b[0], 1)))
+        text_lines = get_page_text_lines(page)
+        visual_regions = extract_slide_visual_regions(
+            page, pno, pdf_doc,
+            rep_xrefs, rep_sigs, template_drawing_rects,
+            text_lines, remove_logos=remove_logos
+        )
 
-        for b in blocks_sorted:
-            if len(b) >= 7 and b[6] != 0:
-                continue
-            y0, y1 = b[1], b[3]
-            raw_text = b[4]
-            if not raw_text.strip():
-                continue
-
-            for raw_line in raw_text.splitlines():
-                cleaned_line = clean_line_characters(raw_line).rstrip()
-                if not cleaned_line.strip():
-                    continue
-
-                if should_exclude_line(
-                    cleaned_line, y0, y1, ph, pno,
-                    user_patterns, auto_repeated_set, pres_titles
-                ):
-                    continue
-
-                p = doc_docx.add_paragraph()
-                p.paragraph_format.space_before = Pt(0)
-                p.paragraph_format.space_after = Pt(2)
-                p.paragraph_format.line_spacing = 1.15
-                r = p.add_run(cleaned_line)
-                r.font.name = "Arial"
-                r.font.size = Pt(10.5)
-                r.font.color.rgb = RGBColor(34, 34, 34)
-
-        raw_imgs = page.get_images()
-        valid_entries = []
-        for im in raw_imgs:
-            xref = im[0]
-            if remove_logos and xref in rep_xrefs:
-                continue
-            try:
-                base = pdf_doc.extract_image(xref)
-            except Exception:
-                continue
-            w, h = base['width'], base['height']
-            sig = (w, h, len(base['image']))
-            if remove_logos and sig in rep_sigs:
-                continue
-
-            rects = page.get_image_rects(xref)
-            for r in rects:
-                if is_logo_or_decoration(r, w, h, pw, ph, remove_logos=remove_logos):
-                    continue
-                valid_entries.append({
-                    'xref': xref,
-                    'w': w,
-                    'h': h,
-                    'rect': r,
-                    'bytes': base['image'],
-                    'ext': base['ext']
-                })
-
-        vector_clip = get_vector_diagram_clip(page, template_drawing_rects)
-        if len(valid_entries) >= 4 and all(ve['w'] < 350 and ve['h'] < 250 for ve in valid_entries):
-            cluster_rect = fitz.Rect(valid_entries[0]['rect'])
-            for ve in valid_entries[1:]:
-                cluster_rect |= ve['rect']
-            if vector_clip:
-                cluster_rect |= vector_clip
-            clip_r = fitz.Rect(
-                max(10, cluster_rect.x0 - 10),
-                max(0.10 * ph, cluster_rect.y0 - 10),
-                min(pw - 10, cluster_rect.x1 + 10),
-                min(0.88 * ph, cluster_rect.y1 + 10)
+        # Sortiranje linija teksta: leva kolona/glavni tok pa desna kolona, odozgo nadole
+        text_lines_sorted = sorted(
+            text_lines,
+            key=lambda tl: (
+                1 if tl["rect"].x0 >= 0.55 * pw else 0,
+                round(tl["rect"].y0 / 4.0),
+                round(tl["rect"].x0, 1)
             )
-            pix = page.get_pixmap(clip=clip_r, dpi=180)
+        )
+
+        for tl in text_lines_sorted:
+            tr = tl["rect"]
+            y0, y1 = tr.y0, tr.y1
+            raw_line = tl["text"]
+
+            # Preskoči tekst koji se već nalazi unutar izvučene slike ili vektorskog dijagrama
+            # (osim ako je u pitanju glavni naslov slajda na vrhu ili bullet stavka)
+            is_slide_title = (y0 <= 0.14 * ph) and (tr.x0 <= 0.50 * pw)
+            if visual_regions and not is_slide_title and not is_bullet_start(raw_line):
+                in_visual_region = False
+                for reg in visual_regions:
+                    rr = fitz.Rect(
+                        reg["rect"].x0 - 4,
+                        reg["rect"].y0 - 4,
+                        reg["rect"].x1 + 4,
+                        reg["rect"].y1 + 4
+                    )
+                    inter = tr & rr
+                    if not inter.is_empty:
+                        ia = inter.width * inter.height
+                        if ia / max(1.0, tr.width * tr.height) >= 0.45:
+                            in_visual_region = True
+                            break
+                if in_visual_region:
+                    continue
+
+            cleaned_line = clean_line_characters(raw_line).rstrip()
+            if not cleaned_line.strip():
+                continue
+
+            if should_exclude_line(
+                cleaned_line, y0, y1, ph, pno,
+                user_patterns, auto_repeated_set, pres_titles
+            ):
+                continue
+
+            p = doc_docx.add_paragraph()
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(2)
+            p.paragraph_format.line_spacing = 1.15
+            r = p.add_run(cleaned_line)
+            r.font.name = "Arial"
+            r.font.size = Pt(10.5)
+            r.font.color.rgb = RGBColor(34, 34, 34)
+
+        # Renderovanje i umetanje svih vizuelnih regiona direktno sa slajda (čuva prozirnost / SMask, rotaciju i spaja segmente)
+        for reg in visual_regions:
+            rr = reg["rect"]
+            clip_r = fitz.Rect(
+                max(0, rr.x0 - 4),
+                max(0, rr.y0 - 4),
+                min(pw, rr.x1 + 4),
+                min(ph, rr.y1 + 4)
+            )
+            if clip_r.is_empty or clip_r.width < 5 or clip_r.height < 5:
+                continue
+            pix = page.get_pixmap(clip=clip_r, dpi=200)
             insert_image(doc_docx, pix.tobytes("png"), pix.width, pix.height)
             images_count += 1
-        elif vector_clip and not valid_entries:
-            pix = page.get_pixmap(clip=vector_clip, dpi=180)
-            insert_image(doc_docx, pix.tobytes("png"), pix.width, pix.height)
-            images_count += 1
-        else:
-            clean_entries = deduplicate_images(valid_entries)
-            clean_entries.sort(key=lambda item: item['rect'].y0)
-            for entry in clean_entries:
-                insert_image(doc_docx, entry['bytes'], entry['w'], entry['h'])
-                images_count += 1
-            if vector_clip:
-                overlaps_img = any(vector_clip.intersects(e['rect']) for e in clean_entries)
-                if not overlaps_img:
-                    pix = page.get_pixmap(clip=vector_clip, dpi=180)
-                    insert_image(doc_docx, pix.tobytes("png"), pix.width, pix.height)
-                    images_count += 1
 
     if master_doc is None:
         doc_docx.save(out_docx_path)
